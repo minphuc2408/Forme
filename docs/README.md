@@ -24,10 +24,14 @@ Mỗi file tối đa 200 dòng. Chỉ mở phần liên quan đến nhiệm vụ
 |---|---|
 | Cấu hình, model, điều phối job | [core](modules/core.md) |
 | Chuẩn hóa văn bản và OCR | [ai](modules/ai.md) |
+| Chọn model, token và hạn mức trước/sau video | [ai-usage](modules/ai-usage.md) |
 | Thu thập nội dung | [scraping](modules/scraping.md) |
 | Giọng đọc | [tts](modules/tts.md) |
+| Kho meme sound và kế hoạch chèn | [meme-library](modules/meme-library.md) |
 | Thẻ và video | [rendering](modules/rendering.md) |
 | Giao diện | [ui](modules/ui.md) |
+| Web local React + Tailwind, API Python | [web](modules/web.md) |
+| PostgreSQL local, schema thread, nhập metadata | [database](modules/database.md) |
 
 ## Phát triển và công cụ
 

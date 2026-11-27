@@ -1,4 +1,4 @@
-"""High-speed FFmpeg compositor (1080x1920 9:16, NVENC GPU auto-detection, 3-channel audio mix)."""
+"""Portrait/landscape FFmpeg compositor with random background seek and audio mix."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -13,8 +13,6 @@ import numpy as np
 
 from ..core.models import LayoutConfig, MediaConfig, SegmentItem, VideoJob
 
-CANVAS_W = 1080
-CANVAS_H = 1920
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"}
 
@@ -34,18 +32,29 @@ def nvenc_available() -> bool:
         return False
 
 
-def probe_duration(media_path: Path) -> float:
+def probe_duration(media_path: Path, *, strict: bool = False) -> float:
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_format",
+        "-select_streams", "v:0", "-show_streams",
         str(media_path),
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         info = json.loads(res.stdout)
-        return float(info["format"]["duration"])
+        duration_value = info.get("format", {}).get("duration")
+        if strict and info.get("streams"):
+            video_duration = info["streams"][0].get("duration")
+            if video_duration not in (None, "", "N/A"):
+                duration_value = video_duration
+        duration = float(duration_value)
+        if res.returncode or not math.isfinite(duration) or duration <= 0 or (strict and not info.get("streams")):
+            raise ValueError("Invalid video duration")
+        return duration
     except Exception:
+        if strict:
+            raise RuntimeError(f"Không đọc được thời lượng/luồng video nền: {media_path}") from None
         return 4.0
 
 
@@ -83,13 +92,21 @@ def compose_final_video(
         media=job.media,
         total_dur=total_dur,
         out_wav=master_audio_wav,
+        meme_sound_plan=job.meme_sound_plan,
     )
 
     # 2. Pick background video
-    bg_candidates = list_media_files(job.media.bg_video_dir, VIDEO_EXTS)
-    if not bg_candidates:
-        raise RuntimeError(f"Không tìm thấy video nền (.mp4) trong thư mục: {job.media.bg_video_dir}")
-    bg_video = random.choice(bg_candidates)
+    if job.media.bg_video_path.strip():
+        bg_video = Path(job.media.bg_video_path.strip()).expanduser()
+        if not bg_video.is_file() or bg_video.suffix.lower() not in VIDEO_EXTS:
+            raise RuntimeError(f"File video nền không hợp lệ: {bg_video}")
+    else:
+        bg_candidates = list_media_files(job.media.bg_video_dir, VIDEO_EXTS)
+        if not bg_candidates:
+            raise RuntimeError(f"Không tìm thấy video nền trong thư mục: {job.media.bg_video_dir}")
+        bg_video = random.choice(bg_candidates)
+    bg_duration = probe_duration(bg_video, strict=True)
+    bg_start = random.uniform(0.0, max(0.0, bg_duration - total_dur)) if job.media.bg_random_start else 0.0
 
     # 3. Prepare concatenated muted B-roll stream if `sub_enabled`
     sub_reel_mp4: Path | None = None
@@ -109,6 +126,11 @@ def compose_final_video(
         json.dumps(
             {
                 "background": str(bg_video),
+                "background_start_sec": bg_start,
+                "background_source_duration_sec": bg_duration,
+                "background_fit": job.media.bg_fit,
+                "aspect_ratio": job.layout.aspect_ratio,
+                "output_size": list(job.layout.canvas_size),
                 "sub_videos": picked_subs,
                 "bgm": selected_bgm,
                 "sfx": selected_sfx,
@@ -126,6 +148,11 @@ def compose_final_video(
         json.dumps([s.to_dict() for s in segments], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if job.media.meme_sound_enabled:
+        (out_dir / "meme-sound-plan.json").write_text(
+            json.dumps({seg.seg_id: job.meme_sound_plan.get(seg.seg_id) for seg in segments}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     # 4. Build single-pass FFmpeg filter_complex graph
     final_mp4 = out_dir / f"{job.title_slug}.mp4"
@@ -138,6 +165,8 @@ def compose_final_video(
         total_dur=total_dur,
         final_mp4=final_mp4,
         prefer_nvenc=prefer_nvenc,
+        bg_start=bg_start,
+        bg_fit=job.media.bg_fit,
     )
     job.output_mp4 = str(final_mp4)
     return final_mp4
@@ -182,6 +211,7 @@ def _mix_master_audio(
     media: MediaConfig,
     total_dur: float,
     out_wav: Path,
+    meme_sound_plan: dict[str, dict] | None = None,
 ) -> tuple[str, list[str]]:
     """Mix narration (100%) + looped BGM (bgm_volume_pct) + transition SFX (sfx_volume_pct)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +243,27 @@ def _mix_master_audio(
             lbl = f"sfx{t_idx}"
             filter_parts.append(f"[{input_idx}:a]volume={vol_sfx:.3f},adelay={delay_ms}|{delay_ms}[{lbl}]")
             mix_labels.append(f"[{lbl}]")
+            input_idx += 1
+
+    if media.meme_sound_enabled and media.meme_sound_volume_pct > 0:
+        for seg in segments:
+            reaction = (meme_sound_plan or {}).get(seg.seg_id)
+            if not reaction:
+                continue
+            sound_path = Path(reaction["file"])
+            if not sound_path.is_file():
+                raise RuntimeError(f"Không tìm thấy meme sound đã chọn: {sound_path.name}")
+            duration = float(reaction["duration_sec"])
+            delay_ms = int(round(float(reaction["start_sec"]) * 1000))
+            volume = max(0, min(100, media.meme_sound_volume_pct)) / 100.0
+            inputs += ["-i", str(sound_path)]
+            label = f"meme{input_idx}"
+            filter_parts.append(
+                f"[{input_idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+                f"afade=t=out:st={max(0.0, duration - 0.04):.3f}:d=0.04,"
+                f"volume={volume:.3f},adelay={delay_ms}:all=1[{label}]"
+            )
+            mix_labels.append(f"[{label}]")
             input_idx += 1
 
     if len(mix_labels) == 1:
@@ -248,8 +299,9 @@ def _build_sub_video_reel(
 ) -> tuple[Path, list[str]]:
     """Stitch random muted B-roll clips scaled/cropped to exact sub-video box dimensions."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
-    target_w = max(64, int(round(CANVAS_W * layout.sub_w_pct / 100.0)) & ~1)
-    target_h = max(64, int(round(CANVAS_H * layout.sub_h_pct / 100.0)) & ~1)
+    canvas_w, canvas_h = layout.canvas_size
+    target_w = max(64, int(round(canvas_w * layout.sub_w_pct / 100.0)) & ~1)
+    target_h = max(64, int(round(canvas_h * layout.sub_h_pct / 100.0)) & ~1)
 
     picked: list[Path] = []
     acc = 0.0
@@ -308,9 +360,12 @@ def _run_ffmpeg_compositor(
     total_dur: float,
     final_mp4: Path,
     prefer_nvenc: bool,
+    bg_start: float = 0.0,
+    bg_fit: str = "cover",
 ) -> None:
+    canvas_w, canvas_h = layout.canvas_size
     inputs: list[str] = [
-        "-stream_loop", "-1", "-t", f"{total_dur:.3f}", "-i", str(bg_video),
+        "-stream_loop", "-1", "-ss", f"{bg_start:.3f}", "-t", f"{total_dur:.3f}", "-i", str(bg_video),
         "-i", str(master_audio_wav),
     ]
     next_idx = 2
@@ -326,25 +381,29 @@ def _run_ffmpeg_compositor(
         card_indices.append((next_idx, seg))
         next_idx += 1
 
-    chains: list[str] = [
-        f"[0:v]fps=24,scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
-        f"crop={CANVAS_W}:{CANVAS_H},setsar=1,format=yuv420p[bg]"
-    ]
+    if bg_fit == "contain":
+        bg_scale = (
+            f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+    else:
+        bg_scale = f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,crop={canvas_w}:{canvas_h}"
+    chains: list[str] = [f"[0:v]setpts=PTS-STARTPTS,fps=24,{bg_scale},setsar=1,format=yuv420p[bg]"]
     curr_v = "bg"
 
     # Overlay secondary B-roll video
     if sub_idx is not None:
-        sub_cx = CANVAS_W * (layout.sub_x_pct / 100.0)
-        sub_cy = CANVAS_H * (layout.sub_y_pct / 100.0)
+        sub_cx = canvas_w * (layout.sub_x_pct / 100.0)
+        sub_cy = canvas_h * (layout.sub_y_pct / 100.0)
         chains.append(
             f"[{curr_v}][{sub_idx}:v]overlay=x={sub_cx:.1f}-w/2:y={sub_cy:.1f}-h/2:shortest=1[v_with_sub]"
         )
         curr_v = "v_with_sub"
 
     # Overlay each Threads comment card on its exact [start_sec, end_sec] window
-    target_card_w = max(240, min(CANVAS_W - 24, int(round(880 * (layout.card_scale_pct / 100.0)))))
-    card_cx = CANVAS_W * (layout.card_x_pct / 100.0)
-    card_cy = CANVAS_H * (layout.card_y_pct / 100.0)
+    target_card_w = layout.card_width_px
+    card_cx = canvas_w * (layout.card_x_pct / 100.0)
+    card_cy = canvas_h * (layout.card_y_pct / 100.0)
 
     for c_i, (inp_i, seg) in enumerate(card_indices):
         scaled_lbl = f"card_s_{c_i}"

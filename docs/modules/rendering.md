@@ -15,13 +15,41 @@ Preview canvas tái sử dụng renderer nên thay hình thẻ ảnh hưởng c�
 
 1. Lấy các đoạn bật có nội dung.
 2. Ghép narration theo timeline và trộn BGM/SFX.
-3. Chọn video nền từ thư mục đã cấu hình.
+3. Ưu tiên file nền riêng; nếu trống thì chọn ngẫu nhiên video trong thư mục.
 4. Nếu bật video phụ và có nguồn, xây reel B-roll tắt tiếng gốc.
 5. Ghi JSON media/layout/timeline rồi gọi FFmpeg tạo MP4.
 
-Kích thước đầu ra 1080×1920; vị trí/kích thước layout dùng phần trăm.
+Nếu bật meme sound, pipeline chọn từ nội dung đã duyệt và dành chỗ sau lời đọc
+trước khi compositor trộn sound. Sound cuối video cũng có đủ thời gian;
+`meme-sound-plan.json` lưu lựa chọn và thời điểm theo `seg_id`.
+Xem [kho meme](meme-library.md).
+
+Kích thước đầu ra 1080×1920 (9:16) hoặc 1920×1080 (16:9) theo `LayoutConfig`.
+Vị trí/kích thước layout vẫn dùng phần trăm trên khung đã chọn; preview cùng tỷ lệ.
 Tùy cấu hình và khả năng encoder, dùng NVENC hoặc libx264.
 Không có đoạn hợp lệ hoặc không có nền video là lỗi cần báo.
+
+## Video Template và Random Start
+
+Trong Nguồn Video · Nhạc, nhập/dán đường dẫn hoặc chọn file Minecraft Parkour
+qua hộp chọn video. File riêng được ưu tiên hơn thư mục nền; xóa đường dẫn để
+quay lại chọn ngẫu nhiên từ thư mục. Thiết lập trước khi đưa job vào hàng đợi.
+
+Khi bật Random Start, với thời lượng nguồn D và thành phẩm T:
+
+- D > T: chọn điểm bắt đầu ngẫu nhiên trong [0, D − T].
+- D ≤ T: bắt đầu từ 0; nền ngắn được lặp đủ thời lượng.
+- Tắt Random Start: luôn bắt đầu từ 0.
+
+Đoạn nền liên tục được seek bằng FFmpeg ngay khi ghép; không cắt sẵn clip trung gian.
+Cover scale và crop giữa để kín khung; Contain giữ toàn hình và thêm viền đen.
+Âm thanh gốc video nền không được trộn vào narration.
+File không tồn tại, không có luồng video hoặc không đọc được thời lượng gây lỗi;
+không dùng thời lượng giả cho nền. Giữ file nguồn nguyên vẹn.
+
+`selected-media.json` giữ trường `background` cũ và thêm điểm bắt đầu, thời lượng
+nguồn, cách fit, tỷ lệ và kích thước đầu ra để kiểm tra lần render đó.
+Random Start mặc định tắt cho cấu hình/preset cũ.
 
 ## File quan trọng
 

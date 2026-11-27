@@ -1,6 +1,6 @@
 # Threads Studio Pro
 
-Ứng dụng desktop Python/PyQt6 biến bài viết và bình luận Threads hoặc kịch bản
+Ứng dụng web local React + Tailwind CSS, backend Python, biến bài viết và bình luận Threads hoặc kịch bản
 nhập tay thành video dọc 1080×1920, có lời đọc tiếng Việt, thẻ bình luận,
 video phụ, nhạc nền và hiệu ứng âm thanh.
 
@@ -12,19 +12,36 @@ video phụ, nhạc nền và hiệu ứng âm thanh.
 
 ## Chạy nhanh trên Windows
 
-Cần Python >=3.10 và FFmpeg/FFprobe trên PATH.
+Cần Python >=3.10, Microsoft Edge đã cài và FFmpeg/FFprobe trên PATH.
 Nếu đã có `.venv`, dùng lại; trên máy mới:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m playwright install chromium
 .\.venv\Scripts\python.exe run_studio.py
 ```
 
 Lần đầu app tạo media mẫu nếu thiếu. Xem hướng dẫn cài đặt để thiết lập
-CLI AI, giọng đọc, Chromium và VieNeu tùy nhu cầu.
+CLI AI, giọng đọc, Microsoft Edge và VieNeu tùy nhu cầu.
+
+App tự mở `http://127.0.0.1:8000`; giữ terminal chạy khi sử dụng.
+Giao diện React đã build nằm trong package Python, không cần Node khi chỉ chạy app.
+Khi sửa frontend hoặc chưa có bản build:
+
+```powershell
+cd web
+npm ci
+npm run build
+```
+
+Chạy từ gốc bằng `run_studio.py --port 8001` nếu cổng mặc định bận;
+`--no-browser` tắt tự mở trình duyệt, `--desktop` mở giao diện Qt cũ.
+Xem [giao diện web local](docs/modules/web.md).
+
+Trang chủ dùng bố cục tối với hai khu vực menu riêng. PostgreSQL local lưu cấu hình,
+job và kịch bản trong schema `thread`; video chỉ lưu path. File kết nối riêng ở
+`user_data/database.json` không đưa vào Git. Xem [database](docs/modules/database.md).
 
 ## Luồng sử dụng
 
@@ -57,7 +74,9 @@ Xem [hướng dẫn chỉ cài CLI](docs/tools/antigravity-cli.md).
 
 ## Công nghệ và nguồn
 
-- [Fluent Blue](https://github.com/danieldev23/fluent-blue): UI trên PyQt6.
+- React + Tailwind CSS, build bằng Vite: giao diện web local.
+- aiohttp: API Python và phục vụ frontend trên loopback.
+- [Fluent Blue](https://github.com/danieldev23/fluent-blue): UI desktop dự phòng và Qt compatibility.
 - [Playwright Python](https://github.com/microsoft/playwright-python): trình duyệt và scraping.
 - [CapCut TTS API](https://github.com/K07VN/capcut-tts-api),
   [Edge-TTS](https://github.com/rany2/edge-tts),

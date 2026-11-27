@@ -28,7 +28,9 @@ from fluent_blue.compatibility.qt import (
 from ..core.models import LayoutConfig, SegmentItem
 
 
-def format_metric(n: int) -> str:
+def format_metric(n: int | None) -> str:
+    if n is None:
+        return "—"
     if n >= 1_000_000:
         v = n / 1_000_000.0
         return f"{v:.1f}M".replace(".0M", "M")
@@ -276,7 +278,7 @@ def _draw_action_bar(painter: QPainter, start_x: float, cy: float, seg: SegmentI
     heart.cubicTo(x + 30, cy - 8, x + 26, cy + 3, x + 14, cy + 11)
     painter.drawPath(heart)
     x += 38
-    if seg.likes > 0:
+    if seg.likes is None or seg.likes > 0:
         x = _draw_metric_text(painter, num_font, color, x, cy, format_metric(seg.likes)) + 34
     else:
         x += 26
@@ -288,7 +290,7 @@ def _draw_action_bar(painter: QPainter, start_x: float, cy: float, seg: SegmentI
     painter.drawPath(bubble)
     painter.drawLine(QPointF(x + 4, cy + 7), QPointF(x + 1, cy + 12))
     x += 36
-    if seg.replies > 0:
+    if seg.replies is None or seg.replies > 0:
         x = _draw_metric_text(painter, num_font, color, x, cy, format_metric(seg.replies)) + 34
     else:
         x += 26
@@ -299,7 +301,7 @@ def _draw_action_bar(painter: QPainter, start_x: float, cy: float, seg: SegmentI
     painter.drawLine(QPointF(x + 18, cy - 13), QPointF(x + 22, cy - 9))
     painter.drawLine(QPointF(x + 18, cy - 5), QPointF(x + 22, cy - 9))
     x += 38
-    if seg.reposts > 0:
+    if seg.reposts is None or seg.reposts > 0:
         x = _draw_metric_text(painter, num_font, color, x, cy, format_metric(seg.reposts)) + 34
     else:
         x += 26

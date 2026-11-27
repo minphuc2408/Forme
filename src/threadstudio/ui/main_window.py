@@ -51,7 +51,6 @@ from fluent_blue.compatibility.qt import (
     QHBoxLayout,
     QMediaPlayer,
     QStackedWidget,
-    Qt,
     QtCore,
     QUrl,
     QVBoxLayout,
@@ -60,13 +59,14 @@ from fluent_blue.compatibility.qt import (
 
 from ..core.config import AppSettings
 from ..ai.text_normalizer import cli_command, cli_environment, normalize_segments_batch
+from ..ai.cli_metadata import capture_quota_before
+from ..ai.usage import track_ai_usage, write_usage
 from ..core.models import (
     CommentMode,
     JobStage,
     LayoutConfig,
     PresetProfile,
     STAGE_LABELS_VI,
-    SegmentItem,
     VideoJob,
     VoiceAssignMode,
 )
@@ -75,6 +75,7 @@ from ..render.ffmpeg_compositor import nvenc_available
 from ..scrapers.threads_scraper import open_threads_login_session, sample_video1_script
 from ..tts.router import TTSRouter, VoiceOption
 from .widgets.stage_canvas import InteractiveStageCanvas
+from .meme_library_page import MemeSoundLibraryPage, build_meme_image_page
 
 Signal = getattr(QtCore, "pyqtSignal", None) or getattr(QtCore, "Signal")
 logger = logging.getLogger("threadstudio")
@@ -148,18 +149,24 @@ class ThreadsStudioWindow(FluentWindow):
         self._nav_queue = self._sidebar.add_item("Tạo Lô · Hàng Đợi", key="queue", icon="layers")
         self._nav_inspector = self._sidebar.add_item("Duyệt Kịch Bản", key="inspector", icon="edit")
         self._sidebar.add_section("Cấu Hình Studio")
-        self._nav_voices = self._sidebar.add_item("Giọng Đọc AI", key="voices", icon="volume")
-        self._nav_media = self._sidebar.add_item("Nguồn Video · Nhạc", key="media", icon="folder")
-        self._nav_settings = self._sidebar.add_item("Cài Đặt · Đa Luồng", key="settings", icon="settings")
+        self._sidebar.add_item("Giọng Đọc AI", key="voices", icon="volume")
+        self._sidebar.add_item("Nguồn Video · Nhạc", key="media", icon="folder")
+        self._sidebar.add_item("Cài Đặt · Đa Luồng", key="settings", icon="settings")
+        self._sidebar.add_section("Kho Meme")
+        self._sidebar.add_item("Meme Sound", key="meme_sound", icon="volume")
+        self._sidebar.add_item("Meme Image · Sắp có", key="meme_image", icon="image")
         ws_row.addWidget(self._sidebar)
 
         self._pages = QStackedWidget()
-        self._page_keys = ["queue", "inspector", "voices", "media", "settings"]
+        self._page_keys = ["queue", "inspector", "voices", "media", "settings", "meme_sound", "meme_image"]
         self._pages.addWidget(self._build_queue_page())
         self._pages.addWidget(self._build_inspector_page())
         self._pages.addWidget(self._build_voices_page())
         self._pages.addWidget(self._build_media_page())
         self._pages.addWidget(self._build_settings_page())
+        self._meme_page = MemeSoundLibraryPage(self.settings, self._ui_pool)
+        self._pages.addWidget(self._meme_page)
+        self._pages.addWidget(build_meme_image_page())
 
         self._center_stage_splitter = Splitter(
             widgets=[self._pages, self._build_right_stage_panel()],
@@ -266,8 +273,8 @@ class ThreadsStudioWindow(FluentWindow):
 
         self._cmt_mode_select = Select(
             options=[
-                ("Nhiều tim · Gồm cả tác giả", CommentMode.TOP_LIKES_WITH_AUTHOR.value),
-                ("Nhiều tim · Không lấy tác giả", CommentMode.TOP_LIKES_NO_AUTHOR.value),
+                ("Gồm cả tác giả", CommentMode.TOP_LIKES_WITH_AUTHOR.value),
+                ("Không lấy tác giả", CommentMode.TOP_LIKES_NO_AUTHOR.value),
                 ("Chỉ bình luận của tác giả (Kể chuyện)", CommentMode.AUTHOR_ONLY.value),
             ],
             value=self.settings.comment_mode,
@@ -292,6 +299,15 @@ class ThreadsStudioWindow(FluentWindow):
         )
         opts_row.add(FormField("Tốc độ đọc", self._speed_quick_spin), 1)
         ingest_panel.add(opts_row)
+
+        self._comment_sort_select = Select(
+            options=[("Nhiều tim", "likes"), ("Nhiều phản hồi", "replies"), ("Nhiều đăng lại", "reposts"), ("Nhiều trích dẫn", "quotes")],
+            value=self.settings.comment_sort,
+        )
+        ingest_panel.add(FormField("Xếp hạng trước khi chọn bình luận", self._comment_sort_select))
+        source_hint = Text("Đọc Threads bằng Edge · cuộn 10 lần. Chỉ xếp hạng bình luận đã tải; không bảo đảm toàn bài.", style="caption", color="text-secondary")
+        source_hint.setWordWrap(True)
+        ingest_panel.add(source_hint)
 
         flags_cta_row = Stack(direction="horizontal", spacing=3, align="center")
         self._chk_hide_name = Checkbox("Che tên tài khoản", checked=self.settings.layout.hide_username)
@@ -392,6 +408,39 @@ class ThreadsStudioWindow(FluentWindow):
         header_panel.add(job_pick_row)
         col.addWidget(header_panel)
 
+        self._candidate_panel = Panel(title="Bình luận đã tải · Bấm cột để sắp xếp", padding=2)
+        self._coverage_text = Text("Chưa có dữ liệu bình luận.", style="caption", color="text-secondary")
+        self._coverage_text.setWordWrap(True)
+        self._candidate_panel.add(self._coverage_text)
+        self._candidate_table = DataTable(
+            columns=[
+                Column("username", "Tài khoản", width=120, sortable=False),
+                Column("text", "Bình luận", width=210, sortable=False),
+                *(Column(key, label, width=85, align="right", formatter=lambda value: "—" if value is None else str(value), sort_key=lambda value: -1 if value is None else value)
+                  for key, label in (("likes", "Tim"), ("replies", "Phản hồi"), ("reposts", "Đăng lại"), ("quotes", "Trích dẫn"))),
+            ],
+            rows=[], page_size=25, selection="single", searchable=True,
+            column_menu=False, exportable=False,
+            empty_title="Chưa có bình luận", empty_description="Dữ liệu nguồn sẽ xuất hiện sau khi tải bài.",
+        )
+        self._candidate_table.setMinimumHeight(180)
+        self._candidate_panel.add(self._candidate_table)
+        candidate_actions = Stack(direction="horizontal", spacing=2)
+        self._candidate_sort_select = Select(
+            options=[("Tim", "likes"), ("Phản hồi", "replies"), ("Đăng lại", "reposts"), ("Trích dẫn", "quotes")], value="likes",
+        )
+        self._candidate_count = NumberInput(value=6, minimum=1, maximum=25, step=1, decimals=0)
+        self._btn_reselect_comments = Button("Chọn lại top N · Chuẩn hóa lại", size="small", icon="refresh-cw")
+        candidate_actions.add(self._candidate_sort_select, 2)
+        candidate_actions.add(self._candidate_count, 1)
+        candidate_actions.add(self._btn_reselect_comments, 3)
+        self._candidate_panel.add(candidate_actions)
+        candidate_hint = Text("Chọn lại thay kịch bản đang sửa. Chế độ chỉ tác giả giữ thứ tự thời gian; không có số lượt lưu/chia sẻ từ nguồn này.", style="caption", color="text-secondary")
+        candidate_hint.setWordWrap(True)
+        self._candidate_panel.add(candidate_hint)
+        col.addWidget(self._candidate_panel)
+        self._candidate_panel.hide()
+
         # Split left segment table vs right text & voice editor
         split = Splitter(orientation="horizontal", collapsible=False)
 
@@ -463,7 +512,7 @@ class ThreadsStudioWindow(FluentWindow):
         split.addWidget(right_box)
         split.setSizes([335, 495])
         col.addWidget(split, 1)
-        return page
+        return ScrollArea(page)
 
     # ------------------------------------------------------------------
     # Page 3: Multi-Engine AI Voice Studio (CapCut + Edge + VieNeu)
@@ -586,7 +635,17 @@ class ThreadsStudioWindow(FluentWindow):
 
         self._picker_bg = FilePicker(mode="directory", button_text="Chọn thư mục")
         self._picker_bg.set_paths([self.settings.media.bg_video_dir])
-        folders_panel.add(FormField("Thư mục Video Nền 9:16 (Ví dụ: nền lưới 3D ô vuông)", self._picker_bg))
+        folders_panel.add(FormField("Thư mục Video Nền (dùng khi chưa chọn file riêng)", self._picker_bg))
+        self._picker_bg_file = FilePicker(mode="open", filter="Video (*.mp4 *.mov *.mkv *.webm *.avi)", placeholder="Nhập đường dẫn video Minecraft Parkour...", button_text="Chọn video")
+        self._picker_bg_file.input.setReadOnly(False)
+        self._picker_bg_file.set_paths([self.settings.media.bg_video_path])
+        folders_panel.add(FormField("File nền riêng · Ưu tiên hơn thư mục", self._picker_bg_file))
+        self._chk_bg_random_start = Checkbox("Random Start · Lấy đoạn ngẫu nhiên đủ thời lượng", checked=self.settings.media.bg_random_start)
+        folders_panel.add(self._chk_bg_random_start)
+        self._aspect_ratio_select = Select(options=[("Dọc 9:16 · 1080×1920", "9:16"), ("Ngang 16:9 · 1920×1080", "16:9")], value=self.settings.layout.aspect_ratio)
+        folders_panel.add(FormField("Tỷ lệ video xuất", self._aspect_ratio_select))
+        self._bg_fit_select = Select(options=[("Lấp đầy · Cắt giữa (Cover)", "cover"), ("Giữ toàn hình · Thêm viền (Contain)", "contain")], value=self.settings.media.bg_fit)
+        folders_panel.add(FormField("Cách đặt video nền", self._bg_fit_select))
 
         self._chk_sub_video = Checkbox(
             "Bật Video Phụ (Meme / Anime / Gameplay tắt tiếng gốc)",
@@ -753,7 +812,7 @@ class ThreadsStudioWindow(FluentWindow):
         btn_snap = Button("Chụp thử ảnh", size="small", variant="ghost", icon="image")
         btn_reset_layout = Button("Đặt lại", size="small", variant="ghost", icon="refresh")
         stage_panel = Panel(
-            title="Sân Khấu 9:16 · 1080p",
+            title="Sân Khấu · 1080p",
             actions=[btn_snap, btn_reset_layout],
             padding=3,
         )
@@ -885,6 +944,9 @@ class ThreadsStudioWindow(FluentWindow):
         self._btn_re_normalize.clicked.connect(self._renormalize_current_job)
         self._btn_approve_current.clicked.connect(self._approve_current_inspected_job)
         self._btn_preview_seg_voice.clicked.connect(self._preview_current_segment_audio)
+        self._btn_reselect_comments.clicked.connect(self._reselect_current_comments)
+        self._candidate_table.view.horizontalHeader().sortIndicatorChanged.connect(self._on_candidate_sort_changed)
+        self._candidate_sort_select.value_changed.connect(self._sort_candidate_table)
 
         # Voice studio signals
         self._btn_audition_play.clicked.connect(self._play_voice_audition)
@@ -914,6 +976,7 @@ class ThreadsStudioWindow(FluentWindow):
             sp.value_changed.connect(self._on_layout_controls_changed)
         self._sel_card_theme.value_changed.connect(self._on_layout_controls_changed)
         self._sel_sub_fit.value_changed.connect(self._on_layout_controls_changed)
+        self._aspect_ratio_select.value_changed.connect(self._on_layout_controls_changed)
 
         # Audio sliders <-> spinners sync
         self._slider_bgm.valueChanged.connect(lambda v: self._spin_bgm.set_value(float(v)))
@@ -925,6 +988,7 @@ class ThreadsStudioWindow(FluentWindow):
         self._btn_login_threads.clicked.connect(self._start_threads_login)
         self._btn_login_ai.clicked.connect(lambda: self._start_ai_login(str(self._ai_provider_select.value())))
         self._btn_save_settings.clicked.connect(self._persist_all_settings)
+        self._meme_page.save_requested.connect(self._persist_all_settings)
 
     def _install_command_palette(self) -> None:
         commands = [
@@ -958,6 +1022,7 @@ class ThreadsStudioWindow(FluentWindow):
 
     def _collect_live_settings(self) -> None:
         self.settings.comment_mode = str(self._cmt_mode_select.value() or CommentMode.TOP_LIKES_WITH_AUTHOR.value)
+        self.settings.comment_sort = str(self._comment_sort_select.value() or "likes")
         self.settings.max_comments = int(self._cmt_count_spin.value())
         self.settings.voice_speed = float(self._speed_quick_spin.value())
         self.settings.require_review_default = self._chk_require_review.isChecked()
@@ -967,6 +1032,9 @@ class ThreadsStudioWindow(FluentWindow):
             self.settings.selected_voices = chosen_voices
 
         self.settings.media.bg_video_dir = self._picker_bg.path()
+        self.settings.media.bg_video_path = self._picker_bg_file.input.text().strip().strip('"')
+        self.settings.media.bg_random_start = self._chk_bg_random_start.isChecked()
+        self.settings.media.bg_fit = str(self._bg_fit_select.value() or "cover")
         self.settings.media.sub_video_dir = self._picker_sub.path()
         self.settings.media.bgm_dir = self._picker_bgm.path()
         self.settings.media.sfx_dir = self._picker_sfx.path()
@@ -974,6 +1042,7 @@ class ThreadsStudioWindow(FluentWindow):
         self.settings.media.bgm_volume_pct = int(self._spin_bgm.value())
         self.settings.media.sfx_enabled = self._chk_sfx.isChecked()
         self.settings.media.sfx_volume_pct = int(self._spin_sfx.value())
+        self._meme_page.collect_settings(self.settings.media)
 
         self.settings.ai_provider = str(self._ai_provider_select.value() or "codex")
         self.settings.codex_model = str(self._codex_model_select.value() or "gpt-6-luna").strip()
@@ -1049,10 +1118,13 @@ class ThreadsStudioWindow(FluentWindow):
             manual_script=manual_script,
             require_review=self.settings.require_review_default,
             comment_mode=self.settings.comment_mode,
+            comment_sort=self.settings.comment_sort,
             max_comments=self.settings.max_comments,
             voice_speed=self.settings.voice_speed,
             voice_assign_mode=self.settings.voice_assign_mode,
             selected_voices=list(self.settings.selected_voices),
+            ai_provider=self.settings.ai_provider,
+            ai_model=self.settings.codex_model if self.settings.ai_provider == "codex" else self.settings.antigravity_model,
             layout=copy.deepcopy(self.settings.layout),
             media=copy.deepcopy(self.settings.media),
         )
@@ -1066,6 +1138,11 @@ class ThreadsStudioWindow(FluentWindow):
         self._refresh_inspector_job_dropdown()
         if self._current_inspect_job_id == job_id:
             job = self.pipeline.jobs.get(job_id)
+            editable = bool(job and job.stage in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value))
+            self._btn_reselect_comments.setEnabled(editable)
+            self._seg_spoken_area.setEnabled(editable)
+            self._seg_raw_area.setEnabled(editable)
+            self._btn_re_normalize.setEnabled(editable)
             if job and job.stage == JobStage.AWAITING_REVIEW.value and not self._seg_table.rows():
                 self._populate_inspector_segments(job)
 
@@ -1077,6 +1154,8 @@ class ThreadsStudioWindow(FluentWindow):
             self._load_job_into_inspector(job_id)
             if len(self.pipeline.job_order) == 1:
                 self._sidebar.set_current("inspector")
+        elif self._current_inspect_job_id == job_id:
+            self._load_job_into_inspector(job_id)
         Toast.show(f"Job #{job_id} đã chuẩn hóa xong — sẵn sàng duyệt kịch bản!", parent=self, variant="info")
 
     def _on_pipeline_job_finished(self, job_id: str, mp4_path: str) -> None:
@@ -1189,14 +1268,49 @@ class ThreadsStudioWindow(FluentWindow):
         if not job:
             return
         self._current_inspect_job_id = jid
+        self._candidate_panel.setVisible(bool(job.comment_candidates))
+        editable = job.stage in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value)
+        self._btn_reselect_comments.setEnabled(editable)
+        self._seg_spoken_area.setEnabled(editable)
+        self._seg_raw_area.setEnabled(editable)
+        self._btn_re_normalize.setEnabled(editable)
+        if job.comment_candidates:
+            self._candidate_table.set_rows(job.comment_candidates[1:])
+            self._candidate_sort_select.set_value(job.comment_sort)
+            self._candidate_count.set_value(job.max_comments)
+            self._sort_candidate_table(job.comment_sort)
+            scrolls = job.comment_coverage.get("scroll_count", 10)
+            count_hint = " Chỉ số đọc từ giao diện có thể làm tròn." if job.comment_coverage.get("extraction") == "dom" else ""
+            self._coverage_text.setText(f"Đã tải {len(job.comment_candidates) - 1} bình luận · Edge cuộn {scrolls} lần · Chỉ xếp hạng trong tập đã tải; không bảo đảm toàn bài.{count_hint}")
+        self.settings.layout = copy.deepcopy(job.layout)
+        self._canvas.set_layout_config(self.settings.layout)
+        self._sync_layout_spinners_from_cfg()
         self._populate_inspector_segments(job)
+
+    def _on_candidate_sort_changed(self, column: int, _order) -> None:
+        keys = ("likes", "replies", "reposts", "quotes")
+        if 2 <= column < 6:
+            self._candidate_sort_select.blockSignals(True)
+            self._candidate_sort_select.set_value(keys[column - 2])
+            self._candidate_sort_select.blockSignals(False)
+
+    def _sort_candidate_table(self, key: object) -> None:
+        if str(key) in {"likes", "replies", "reposts", "quotes"}:
+            self._candidate_table.sort_by(str(key), descending=True)
+
+    def _reselect_current_comments(self) -> None:
+        jid = self._current_inspect_job_id or ""
+        if self.pipeline.reselect_comments(jid, str(self._candidate_sort_select.value()), int(self._candidate_count.value())):
+            self._btn_reselect_comments.setEnabled(False)
+        else:
+            Toast.show("Chỉ chọn lại khi job đang chờ duyệt hoặc đã lỗi và có dữ liệu bình luận.", parent=self, variant="info")
 
     def _populate_inspector_segments(self, job: VideoJob, select_idx: int = 0) -> None:
         rows = []
         for idx, seg in enumerate(job.segments):
             mark = "✓" if seg.enabled else "✕"
             idx_lbl = f"{mark} Gốc" if seg.is_root_post else f"{mark} #{idx}"
-            meta = f"@{seg.username}" if seg.is_root_post else f"♥ {seg.likes}"
+            meta = f"@{seg.username}" if seg.is_root_post else f"♥ {seg.likes if seg.likes is not None else '—'}"
             rows.append(
                 {
                     "row_idx": idx,
@@ -1239,6 +1353,8 @@ class ThreadsStudioWindow(FluentWindow):
         if self._syncing_segment_editor:
             return
         job = self.pipeline.jobs.get(self._current_inspect_job_id or "")
+        if job and job.stage not in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value):
+            return
         row = self._current_seg_idx
         if not job or not (0 <= row < len(job.segments)):
             return
@@ -1252,6 +1368,8 @@ class ThreadsStudioWindow(FluentWindow):
 
     def _move_current_segment(self, delta: int) -> None:
         job = self.pipeline.jobs.get(self._current_inspect_job_id or "")
+        if job and job.stage not in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value):
+            return
         row = self._current_seg_idx
         if not job or (row <= 0 and delta < 0):
             return
@@ -1285,9 +1403,12 @@ class ThreadsStudioWindow(FluentWindow):
 
         def _run() -> None:
             try:
-                result = normalize_segments_batch(
-                    segments, ai_provider=provider, ai_model=model, include_emotion_cues=emotion_cues,
-                )
+                capture_quota_before(job, provider)
+                with track_ai_usage(job, "Chuẩn hóa lại trong Inspector"):
+                    result = normalize_segments_batch(
+                        segments, ai_provider=provider, ai_model=model, include_emotion_cues=emotion_cues,
+                    )
+                write_usage(job)
                 self._bridge.ai_normalized.emit(job.job_id, result, "")
             except Exception as exc:
                 self._bridge.ai_normalized.emit(job.job_id, {}, str(exc))
@@ -1400,6 +1521,7 @@ class ThreadsStudioWindow(FluentWindow):
         self._syncing_layout_controls = True
         try:
             cfg = self.settings.layout
+            self._aspect_ratio_select.set_value(cfg.aspect_ratio)
             self._spin_card_x.set_value(cfg.card_x_pct)
             self._spin_card_y.set_value(cfg.card_y_pct)
             self._spin_card_scale.set_value(cfg.card_scale_pct)
@@ -1416,11 +1538,15 @@ class ThreadsStudioWindow(FluentWindow):
             self._sel_sub_fit.set_value(cfg.sub_fit)
         finally:
             self._syncing_layout_controls = False
+        job = self.pipeline.jobs.get(self._current_inspect_job_id or "")
+        if job and job.stage in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value):
+            job.layout = copy.deepcopy(self.settings.layout)
 
     def _on_layout_controls_changed(self, *_args) -> None:
         if self._syncing_layout_controls:
             return
         cfg = self.settings.layout
+        cfg.aspect_ratio = str(self._aspect_ratio_select.value() or "9:16")
         cfg.card_x_pct = float(self._spin_card_x.value())
         cfg.card_y_pct = float(self._spin_card_y.value())
         cfg.card_scale_pct = float(self._spin_card_scale.value())
@@ -1436,7 +1562,10 @@ class ThreadsStudioWindow(FluentWindow):
         cfg.sub_radius_px = int(self._spin_sub_rad.value())
         cfg.sub_fit = str(self._sel_sub_fit.value() or "cover")
 
-        self._canvas.refresh_card()
+        self._canvas.set_layout_config(cfg)
+        job = self.pipeline.jobs.get(self._current_inspect_job_id or "")
+        if job and job.stage in (JobStage.AWAITING_REVIEW.value, JobStage.FAILED.value):
+            job.layout = copy.deepcopy(cfg)
 
     def _reset_layout_defaults(self) -> None:
         self.settings.layout = LayoutConfig()
@@ -1444,7 +1573,8 @@ class ThreadsStudioWindow(FluentWindow):
         self._sync_layout_spinners_from_cfg()
 
     def _export_stage_snapshot(self) -> None:
-        out_png = self.settings.resolved_output_root() / "preview_snapshot_9x16.png"
+        ratio = self.settings.layout.aspect_ratio.replace(":", "x")
+        out_png = self.settings.resolved_output_root() / f"preview_snapshot_{ratio}.png"
         self._canvas.export_snapshot(str(out_png))
         Toast.show(f"Đã lưu ảnh chụp bố cục: {out_png.name}", parent=self, variant="success")
 
@@ -1454,6 +1584,7 @@ class ThreadsStudioWindow(FluentWindow):
             return
         p = self.settings.presets[int(idx)]
         self._cmt_mode_select.set_value(p.comment_mode)
+        self._comment_sort_select.set_value(p.comment_sort)
         self._cmt_count_spin.set_value(p.max_comments)
         self._speed_quick_spin.set_value(p.voice_speed)
         self._voice_assign_select.set_value(p.voice_assign_mode)
@@ -1463,6 +1594,9 @@ class ThreadsStudioWindow(FluentWindow):
 
         self.settings.media = copy.deepcopy(p.media)
         self._picker_bg.set_paths([p.media.bg_video_dir])
+        self._picker_bg_file.set_paths([p.media.bg_video_path])
+        self._chk_bg_random_start.setChecked(p.media.bg_random_start)
+        self._bg_fit_select.set_value(p.media.bg_fit)
         self._picker_sub.set_paths([p.media.sub_video_dir])
         self._picker_bgm.set_paths([p.media.bgm_dir])
         self._picker_sfx.set_paths([p.media.sfx_dir])
@@ -1470,6 +1604,7 @@ class ThreadsStudioWindow(FluentWindow):
         self._spin_bgm.set_value(p.media.bgm_volume_pct)
         self._chk_sfx.setChecked(p.media.sfx_enabled)
         self._spin_sfx.set_value(p.media.sfx_volume_pct)
+        self._meme_page.set_media(p.media)
 
         self.settings.layout = copy.deepcopy(p.layout)
         self._canvas.set_layout_config(self.settings.layout)
@@ -1485,6 +1620,7 @@ class ThreadsStudioWindow(FluentWindow):
         new_p = PresetProfile(
             name=name,
             comment_mode=self.settings.comment_mode,
+            comment_sort=self.settings.comment_sort,
             max_comments=self.settings.max_comments,
             voice_speed=self.settings.voice_speed,
             voice_assign_mode=self.settings.voice_assign_mode,
@@ -1501,9 +1637,9 @@ class ThreadsStudioWindow(FluentWindow):
         Toast.show(f"Đã lưu Preset '{name}'!", parent=self, variant="success")
 
     def _start_threads_login(self) -> None:
-        profile_dir = self.settings.user_data_dir() / "threads_profile"
+        profile_dir = self.settings.user_data_dir() / "threads_edge_profile"
         Toast.show(
-            "Đang mở trình duyệt đăng nhập Threads. Đăng nhập xong hãy đóng cửa sổ trình duyệt để lưu phiên.",
+            "Đang mở Edge đăng nhập Threads bằng profile riêng của app. Đăng nhập xong hãy đóng cửa sổ để lưu phiên.",
             parent=self,
             variant="info",
             duration=5500,
@@ -1512,7 +1648,7 @@ class ThreadsStudioWindow(FluentWindow):
         def _run() -> None:
             try:
                 open_threads_login_session(profile_dir)
-                self._bridge.login_finished.emit("Đã lưu phiên đăng nhập Threads thành công!")
+                self._bridge.login_finished.emit("Đã đóng Edge và lưu profile Threads. Phiên đăng nhập sẽ được dùng khi đọc bài.")
             except Exception as exc:
                 logger.error("Lỗi mở trình duyệt đăng nhập: %s", exc)
 

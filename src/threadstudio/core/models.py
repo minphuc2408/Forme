@@ -6,6 +6,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+import json
+import logging
+import time
 import uuid
 
 
@@ -48,7 +51,9 @@ STAGE_LABELS_VI: dict[str, str] = {
 
 @dataclass
 class LayoutConfig:
-    """Normalized percentage coordinates on a 1080x1920 (9:16) canvas."""
+    """Normalized percentage coordinates on a portrait or landscape canvas."""
+
+    aspect_ratio: str = "9:16"
 
     # Comment / Post Card
     card_x_pct: float = 50.0
@@ -67,6 +72,15 @@ class LayoutConfig:
     sub_radius_px: int = 0
     sub_fit: str = "cover"  # "cover" | "contain"
 
+    @property
+    def canvas_size(self) -> tuple[int, int]:
+        return (1920, 1080) if self.aspect_ratio == "16:9" else (1080, 1920)
+
+    @property
+    def card_width_px(self) -> int:
+        width, height = self.canvas_size
+        return max(240, min(width - 24, int(round(880 * min(width, height) / 1080 * self.card_scale_pct / 100))))
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -81,6 +95,9 @@ class MediaConfig:
     """Folder paths and audio mixing levels."""
 
     bg_video_dir: str = ""
+    bg_video_path: str = ""
+    bg_random_start: bool = False
+    bg_fit: str = "cover"
     sub_video_dir: str = ""
     bgm_dir: str = ""
     sfx_dir: str = ""
@@ -88,6 +105,11 @@ class MediaConfig:
     bgm_volume_pct: int = 20
     sfx_enabled: bool = False
     sfx_volume_pct: int = 40
+    meme_sound_dir: str = "assets/meme-sound"
+    meme_sound_enabled: bool = False
+    meme_sound_volume_pct: int = 40
+    meme_sound_max_per_video: int = 3
+    meme_sound_max_duration_sec: float = 6.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,6 +126,7 @@ class PresetProfile:
 
     name: str
     comment_mode: str = CommentMode.TOP_LIKES_WITH_AUTHOR.value
+    comment_sort: str = "likes"
     max_comments: int = 6
     voice_speed: float = 1.20
     voice_assign_mode: str = VoiceAssignMode.RANDOM.value
@@ -115,6 +138,7 @@ class PresetProfile:
         return {
             "name": self.name,
             "comment_mode": self.comment_mode,
+            "comment_sort": self.comment_sort,
             "max_comments": self.max_comments,
             "voice_speed": self.voice_speed,
             "voice_assign_mode": self.voice_assign_mode,
@@ -128,6 +152,7 @@ class PresetProfile:
         return cls(
             name=data.get("name", "Mặc định"),
             comment_mode=data.get("comment_mode", CommentMode.TOP_LIKES_WITH_AUTHOR.value),
+            comment_sort=data.get("comment_sort", "likes"),
             max_comments=int(data.get("max_comments", 6)),
             voice_speed=float(data.get("voice_speed", 1.20)),
             voice_assign_mode=data.get("voice_assign_mode", VoiceAssignMode.RANDOM.value),
@@ -150,13 +175,18 @@ class SegmentItem:
     spoken_text: str = ""
     image_urls: list[str] = field(default_factory=list)
     image_locals: list[str] = field(default_factory=list)
-    likes: int = 0
-    replies: int = 0
-    reposts: int = 0
+    likes: int | None = 0
+    replies: int | None = 0
+    reposts: int | None = 0
+    quotes: int | None = None
+    source_post_id: str = ""
+    parent_post_id: str = ""
+    timestamp: str = ""
     enabled: bool = True
     voice_id: str = ""
     card_png_path: str = ""
     audio_wav_path: str = ""
+    audio_fingerprint: str = ""
     duration_sec: float = 0.0
     start_sec: float = 0.0
     end_sec: float = 0.0
@@ -183,6 +213,7 @@ class VideoJob:
     # Per-job snapshot of settings so batch jobs stay isolated
     require_review: bool = True
     comment_mode: str = CommentMode.TOP_LIKES_WITH_AUTHOR.value
+    comment_sort: str = "likes"
     max_comments: int = 6
     voice_speed: float = 1.20
     voice_assign_mode: str = VoiceAssignMode.RANDOM.value
@@ -191,6 +222,12 @@ class VideoJob:
     media: MediaConfig = field(default_factory=MediaConfig)
 
     # Runtime state
+    ai_provider: str = ""
+    ai_model: str = ""
+    ai_usage: dict[str, Any] = field(default_factory=dict)
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    checkpoint_at: float = 0.0
+    resume_on_startup: bool = False
     stage: str = JobStage.QUEUED.value
     progress_pct: float = 0.0
     status_detail: str = "Đang nằm trong hàng đợi"
@@ -199,6 +236,9 @@ class VideoJob:
     output_mp4: str = ""
     total_duration_sec: float = 0.0
     segments: list[SegmentItem] = field(default_factory=list)
+    comment_candidates: list[dict[str, Any]] = field(default_factory=list)
+    comment_coverage: dict[str, Any] = field(default_factory=dict)
+    meme_sound_plan: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def ensure_output_dir(self, base_output: Path) -> Path:
         if self.output_dir:
@@ -210,6 +250,17 @@ class VideoJob:
         for sub in ("audio", "cards", "styled-cards", "clips", "video-phu", "media-cache"):
             (out / sub).mkdir(parents=True, exist_ok=True)
         return out
+
+    def save_checkpoint(self) -> None:
+        if self.output_dir:
+            path = Path(self.output_dir) / "job-checkpoint.json"
+            try:
+                self.checkpoint_at = time.time()
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(path)
+            except OSError:
+                logging.getLogger("threadstudio").warning("Chưa ghi được checkpoint job #%s; PostgreSQL vẫn được thử lưu định kỳ.", self.job_id)
 
     @property
     def enabled_segments(self) -> list[SegmentItem]:

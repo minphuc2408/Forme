@@ -8,8 +8,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 from ..core.models import SegmentItem
+from .usage import TOKEN_FIELDS, record_usage, token_counts, utc_now
 
 
 def cli_command(provider: str) -> list[str]:
@@ -176,6 +178,10 @@ def normalize_segments_batch(
         seg.spoken_text = offline_map[seg.seg_id]
 
     if ai_provider == "offline" or not segments:
+        if segments and ai_provider == "offline":
+            record_usage({"provider": "offline", "model": "", "status": "done", "started_at": utc_now(),
+                          "duration_seconds": 0, "image_count": 0, "source": "offline_dictionary",
+                          **{key: 0 for key in TOKEN_FIELDS}})
         return offline_map
 
     ai_map = _call_cli_batch(
@@ -196,7 +202,6 @@ def _call_cli_batch(
     model: str,
     include_emotion_cues: bool,
 ) -> dict[str, str]:
-    command = cli_command(provider)
     emotion_rule = (
         "Nếu câu có tiếng cười lớn (=))), haha) có thể chèn [cười], thở dài chèn [thở dài]."
         if include_emotion_cues
@@ -228,12 +233,45 @@ def _call_cli_batch(
                 prompt += (f"\nẢnh số {len(images)} thuộc đoạn {seg.seg_id}. "
                            "Nếu ảnh có chữ, hãy đọc phần chữ quan trọng và bổ sung vào lời đọc đoạn này.")
 
+    parsed = call_cli_json(prompt, provider=provider, model=model, images=images)
+    if not isinstance(parsed, dict) or any(
+        not isinstance(parsed.get(s.seg_id), str) or not parsed[s.seg_id].strip() for s in segments
+    ):
+        raise RuntimeError(f"{provider} CLI trả thiếu lời đọc. Hãy thử lại hoặc chọn model khác.")
+    return {s.seg_id: parsed[s.seg_id] for s in segments}
+
+
+def call_cli_json(
+    prompt: str, *, provider: str, model: str, images: list[Path] | None = None,
+) -> object:
+    """Keep the JSON return contract while recording reported per-call CLI usage."""
+    started = time.monotonic()
+    record = {"provider": provider, "model": model, "started_at": utc_now(), "status": "failed",
+              "image_count": len(images or []), "source": "cli_reported", **{key: None for key in TOKEN_FIELDS}}
+    try:
+        parsed = _execute_cli_json(prompt, provider=provider, model=model, images=images, usage_record=record)
+        record["status"] = "done"
+        return parsed
+    except Exception as exc:
+        record["error_type"] = type(exc).__name__
+        raise
+    finally:
+        record["duration_seconds"] = round(time.monotonic() - started, 3)
+        record_usage(record)
+
+
+def _execute_cli_json(
+    prompt: str, *, provider: str, model: str, images: list[Path] | None, usage_record: dict,
+) -> object:
+    """Run a bounded account-authenticated JSON task with the existing CLI protections."""
+    command = cli_command(provider)
+    images = images or []
     env = cli_environment()
     # Isolate automation from project instructions, hooks and cached conversations.
     with tempfile.TemporaryDirectory(prefix="threadstudio-ai-") as work_dir:
         if provider == "codex":
             command += ["exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
-                        "--sandbox", "read-only", "--color", "never",
+                        "--sandbox", "read-only", "--color", "never", "--json",
                         "-c", 'forced_login_method="chatgpt"']
             if model:
                 command += ["--model", model]
@@ -263,6 +301,23 @@ def _call_cli_batch(
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"{provider} CLI quá thời gian 180 giây. Hãy thử model nhẹ hơn.") from exc
+        events = []
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line)
+                if isinstance(event, dict):
+                    events.append(event)
+            except ValueError:
+                continue
+        if provider == "codex":
+            reports = [token_counts(event.get("usage"), provider) for event in events if event.get("type") == "turn.completed"]
+            for key in TOKEN_FIELDS:
+                values = [report[key] for report in reports if report[key] is not None]
+                usage_record[key] = sum(values) if values else None
+        else:
+            envelopes = [event.get("result") for event in events if event.get("event") == "result" and isinstance(event.get("result"), dict)]
+            if envelopes:
+                usage_record.update(token_counts(envelopes[-1].get("usage"), provider))
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(
@@ -271,7 +326,16 @@ def _call_cli_batch(
             )
 
     response = result.stdout.strip()
-    if provider == "antigravity":
+    if provider == "codex":
+        failures = [event for event in events if event.get("type") in {"turn.failed", "error"}]
+        if failures:
+            raise RuntimeError("Codex CLI báo lỗi lượt chạy. Kiểm tra đăng nhập, model và quota.")
+        messages = [event["item"]["text"] for event in events if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict) and event["item"].get("type") == "agent_message"
+                    and isinstance(event["item"].get("text"), str)]
+        if messages:
+            response = messages[-1].strip()
+    else:
         try:
             events = [json.loads(line) for line in response.splitlines() if line.strip()]
             results = [event.get("result") for event in events
@@ -289,9 +353,5 @@ def _call_cli_batch(
         parsed = json.loads(response)
     except (ValueError, TypeError) as exc:
         raise RuntimeError(f"{provider} CLI không trả về JSON hợp lệ. Hãy thử model khác.") from exc
-    if not isinstance(parsed, dict) or any(
-        not isinstance(parsed.get(s.seg_id), str) or not parsed[s.seg_id].strip() for s in segments
-    ):
-        raise RuntimeError(f"{provider} CLI trả thiếu lời đọc. Hãy thử lại hoặc chọn model khác.")
-    return {s.seg_id: parsed[s.seg_id] for s in segments}
+    return parsed
 

@@ -6,5 +6,34 @@ build/
 dist/
 output/
 user_data/
+assets/meme-sound/
 .video-review/
 snaptik.vn_*.mp4
+# Environment and credentials
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+device.json
+*secrets.json
+*.pem
+*.key
+*.p12
+
+# AI CLI local data
+.codex/
+.gemini/
+.agy/
+
+# Local indexes and logs
+.codegraph/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# React frontend dependencies
+web/node_modules/
+web/.vite/

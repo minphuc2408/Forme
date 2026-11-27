@@ -188,7 +188,6 @@ def _generate_broll_starfield_mp4(out_path: Path, width: int = 640, height: int 
 def _generate_warm_bgm_wav(out_path: Path, duration_sec: float = 16.0, sr: int = 44100) -> None:
     """Synthesize a gentle, copyright-free warm electric-piano chord progression loop."""
     n = int(duration_sec * sr)
-    t = np.linspace(0, duration_sec, n, endpoint=False)
     chords = [
         (261.63, 329.63, 392.00, 493.88),  # Cmaj7
         (220.00, 261.63, 329.63, 392.00),  # Am7

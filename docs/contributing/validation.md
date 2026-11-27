@@ -13,6 +13,7 @@ Theo yêu cầu chủ dự án, không tạo file test hoặc chạy Java khi ch
 | Config/model | Giá trị mặc định, nạp dữ liệu cũ, serialization, UI đọc/ghi |
 | AI CLI | Model, OAuth, env API key, ảnh, stdout/JSON, timeout và lỗi provider |
 | UI | Khởi tạo, signals, không block main thread, chọn/lưu/nạp setting |
+| Web React/Tailwind | `npm run build` trong `web/`, browser local, HTTP API, giữ draft khi polling |
 | TTS | Giọng, format WAV, thời lượng và timeline |
 | Render/layout | Preview và video ngắn; codec/kích thước/audio qua FFprobe |
 

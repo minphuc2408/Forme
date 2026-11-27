@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import random
 import subprocess
 import urllib.request
 import wave
+from typing import Callable
 
 from ..core.models import SegmentItem, VoiceAssignMode
 
@@ -165,6 +167,10 @@ class TTSRouter:
         *,
         speed: float = 1.20,
         max_workers: int = 4,
+        reuse_existing: bool = False,
+        reuse_legacy: bool = False,
+        cancelled: Callable[[], bool] | None = None,
+        on_segment_done: Callable[[], None] | None = None,
     ) -> float:
         """Synthesize all enabled segments concurrently and build contiguous timeline."""
         audio_dir.mkdir(parents=True, exist_ok=True)
@@ -172,19 +178,62 @@ class TTSRouter:
         if not enabled:
             raise RuntimeError("Không có đoạn nội dung nào được bật để tạo giọng đọc.")
 
+        def synthesize(text: str, voice: str, path: Path) -> float | None:
+            if cancelled and cancelled():
+                return None
+            return self.synthesize_single(text, voice, path, speed=speed)
+
+        failure = None
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
             futs = {}
             for idx, seg in enumerate(enabled):
                 txt = seg.spoken_text.strip() or seg.raw_text.strip()
                 wav_path = audio_dir / f"{idx:02d}_{seg.seg_id}.wav"
-                fut = pool.submit(self.synthesize_single, txt, seg.voice_id, wav_path, speed=speed)
-                futs[fut] = (seg, wav_path)
+                signature = [txt, seg.voice_id, speed]
+                if seg.voice_id.startswith("vieneu:"):
+                    reference = Path(self.vieneu_clone_ref_audio) if self.vieneu_clone_ref_audio else None
+                    signature.extend([self.vieneu_endpoint, self.vieneu_clone_ref_audio, self.vieneu_clone_ref_text,
+                                      reference.stat().st_mtime_ns if reference and reference.is_file() else None])
+                fingerprint = hashlib.sha256(json.dumps(signature, ensure_ascii=False).encode("utf-8")).hexdigest()
+                cached = Path(seg.audio_wav_path) if seg.audio_wav_path else wav_path
+                if reuse_existing and (seg.audio_fingerprint == fingerprint or (reuse_legacy and not seg.audio_fingerprint)):
+                    try:
+                        if cached.resolve().parent == audio_dir.resolve():
+                            with wave.open(str(cached), "rb") as wav:
+                                frames, rate = wav.getnframes(), wav.getframerate()
+                                if frames > 0 and rate > 0 and len(wav.readframes(frames)) == frames * wav.getnchannels() * wav.getsampwidth():
+                                    seg.audio_wav_path = str(cached)
+                                    seg.audio_fingerprint = fingerprint
+                                    seg.duration_sec = round(max(0.4, frames / rate), 3)
+                                    if on_segment_done:
+                                        on_segment_done()
+                                    continue
+                    except (OSError, EOFError, wave.Error):
+                        pass
+                # Clear stale metadata before replacing audio, so interrupted writes cannot be reused.
+                seg.audio_fingerprint = ""
+                fut = pool.submit(synthesize, txt, seg.voice_id, wav_path)
+                futs[fut] = (seg, wav_path, fingerprint)
 
             for fut in as_completed(futs):
-                seg, wav_path = futs[fut]
-                dur = fut.result()
+                seg, wav_path, fingerprint = futs[fut]
+                try:
+                    dur = fut.result()
+                except Exception as exc:
+                    failure = failure or exc
+                    continue
+                if dur is None:
+                    continue
                 seg.audio_wav_path = str(wav_path)
+                seg.audio_fingerprint = fingerprint
                 seg.duration_sec = round(max(0.4, dur), 3)
+                if on_segment_done:
+                    on_segment_done()
+
+        if cancelled and cancelled():
+            return 0.0
+        if failure:
+            raise failure
 
         # Build timeline timestamps with a natural 0.18s breather pause between comments
         pause_sec = 0.18

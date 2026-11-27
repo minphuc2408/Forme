@@ -34,6 +34,7 @@ class AppSettings:
     # Active workspace defaults
     require_review_default: bool = True
     comment_mode: str = CommentMode.TOP_LIKES_WITH_AUTHOR.value
+    comment_sort: str = "likes"
     max_comments: int = 6
     voice_speed: float = 1.20
     preview_voice_id: str = "capcut:BV421_vivn_streaming"
@@ -78,6 +79,7 @@ class AppSettings:
             "prefer_nvenc": self.prefer_nvenc,
             "require_review_default": self.require_review_default,
             "comment_mode": self.comment_mode,
+            "comment_sort": self.comment_sort,
             "max_comments": self.max_comments,
             "voice_speed": self.voice_speed,
             "preview_voice_id": self.preview_voice_id,
@@ -141,6 +143,7 @@ class AppSettings:
             prefer_nvenc=bool(raw.get("prefer_nvenc", True)),
             require_review_default=bool(raw.get("require_review_default", True)),
             comment_mode=raw.get("comment_mode", CommentMode.TOP_LIKES_WITH_AUTHOR.value),
+            comment_sort=raw.get("comment_sort", "likes"),
             max_comments=int(raw.get("max_comments", 6)),
             voice_speed=float(raw.get("voice_speed", 1.20)),
             preview_voice_id=raw.get("preview_voice_id", "capcut:BV421_vivn_streaming"),

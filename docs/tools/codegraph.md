@@ -10,13 +10,16 @@ Ví dụ query: `_call_cli_batch _on_ai_provider_changed AppSettings`.
 Kết quả trả source và quan hệ caller; không cần đọc lại phần source đã có trong kết quả.
 Nếu query bị cắt, dùng tên symbol cụ thể hơn.
 
-CLI dự phòng, chạy từ gốc dự án:
+Nếu MCP không dùng được, thử CLI dự phòng từ gốc dự án:
 
 ```powershell
 codegraph explore "normalize_segments_batch _call_cli_batch"
 ```
 
 Trên PowerShell bị chặn script launcher, dùng `codegraph.cmd` thay `codegraph`.
+Nếu CodeGraph không khả dụng qua cả MCP và CLI hoặc chưa có index, dùng `rg`/`rg --files`
+trong thư mục liên quan; bỏ qua `.venv/`, `output/`, `user_data/`, binary và cache.
+Nói rõ giới hạn của CodeGraph khi dùng tìm kiếm thường.
 
 ## Đồng bộ sau thay đổi
 

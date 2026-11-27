@@ -5,8 +5,6 @@ and the Secondary B-roll Video region, with zero hardcoded stylesheets.
 """
 from __future__ import annotations
 
-import math
-
 from fluent_blue import ThemeManager
 from fluent_blue.compatibility.qt import (
     QBrush,
@@ -35,7 +33,7 @@ Signal = getattr(QtCore, "pyqtSignal", None) or getattr(QtCore, "Signal")
 
 
 class InteractiveStageCanvas(ThemedMixin, QWidget):
-    """Live 9:16 WYSIWYG preview stage with mouse drag & wheel scale."""
+    """Portrait/landscape preview stage with mouse drag & wheel scale."""
 
     layout_edited = Signal()
     layer_selected = Signal(str)  # "card" | "sub"
@@ -80,16 +78,14 @@ class InteractiveStageCanvas(ThemedMixin, QWidget):
         self._rebuild_card_image()
         self.update()
 
-    def refresh_card(self) -> None:
-        self._rebuild_card_image()
-        self.update()
-
     def export_snapshot(self, out_png: str) -> None:
-        stage_img = QImage(540, 960, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas_w, canvas_h = self._layout_cfg.canvas_size
+        width, height = canvas_w // 2, canvas_h // 2
+        stage_img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
         painter = QPainter(stage_img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        self._paint_stage_contents(painter, QRectF(0, 0, 540, 960), draw_handles=False)
+        self._paint_stage_contents(painter, QRectF(0, 0, width, height), draw_handles=False)
         painter.end()
         stage_img.save(out_png, "PNG")
 
@@ -100,12 +96,14 @@ class InteractiveStageCanvas(ThemedMixin, QWidget):
         pad = float(ThemeManager.spacing(2))
         avail_w = max(80.0, self.width() - pad * 2)
         avail_h = max(140.0, self.height() - pad * 2)
-        if avail_w / avail_h > 9.0 / 16.0:
+        canvas_w, canvas_h = self._layout_cfg.canvas_size
+        ratio = canvas_w / canvas_h
+        if avail_w / avail_h > ratio:
             sh = avail_h
-            sw = sh * (9.0 / 16.0)
+            sw = sh * ratio
         else:
             sw = avail_w
-            sh = sw * (16.0 / 9.0)
+            sh = sw / ratio
         sx = (self.width() - sw) * 0.5
         sy = (self.height() - sh) * 0.5
         return QRectF(sx, sy, sw, sh)
@@ -113,7 +111,7 @@ class InteractiveStageCanvas(ThemedMixin, QWidget):
     def _card_rect_in_stage(self, stage: QRectF) -> QRectF:
         if self._card_cache is None or self._card_cache.width() == 0:
             return QRectF()
-        rel_w = (880.0 / 1080.0) * (self._layout_cfg.card_scale_pct / 100.0)
+        rel_w = self._layout_cfg.card_width_px / self._layout_cfg.canvas_size[0]
         draw_w = stage.width() * rel_w
         aspect = self._card_cache.height() / float(self._card_cache.width())
         draw_h = draw_w * aspect
